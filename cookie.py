@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import pymysql
 from pymysql.cursors import DictCursor
@@ -8,7 +8,6 @@ from functools import wraps
 
 app = Flask(__name__)
 
-# ================= CORS (CORRECT FOR COOKIES) =================
 CORS(
     app,
     supports_credentials=True,
@@ -17,7 +16,6 @@ CORS(
 
 app.config["SECRET_KEY"] = "sriram_jwt_secret_key_24"
 
-# ================= DATABASE =================
 def get_connection():
     return pymysql.connect(
         host="localhost",
@@ -27,72 +25,130 @@ def get_connection():
         cursorclass=DictCursor
     )
 
-# ================= JWT =================
 def generate_token(user_id):
     payload = {
         "user_id": user_id,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
     }
-    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+    token = jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+    return token
 
 def token_required(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
+    def decorated():
         token = request.cookies.get("token")
+
         if not token:
             return jsonify({"error": "Token missing"}), 401
+
         try:
-            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-            request.user_id = data["user_id"]
+            decoded = jwt.decode(token,app.config["SECRET_KEY"],algorithms=["HS256"])
+            request.user_id = decoded["user_id"]
+
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token expired"}), 401
+
         except jwt.InvalidTokenError:
             return jsonify({"error": "Invalid token"}), 401
-        return f(*args, **kwargs)
+
+        return f()
+
     return decorated
 
-# ================= LOGIN =================
 @app.route("/login", methods=["POST"])
 def login():
     data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
     username = data.get("username")
     password = data.get("password")
 
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
+    if not username and not password:
+        return jsonify({"error": "Please send username and password"}), 400
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    if not username:
+        return jsonify({"error": "Please send username"}), 400
 
-    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
-    user = cursor.fetchone()
+    if not password:
+        return jsonify({"error": "Please send password"}), 400
 
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
 
-    if not user or user["password"] != password:
-        return jsonify({"error": "Invalid credentials"}), 401
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    token = generate_token(user["id"])
+        cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
+        user = cursor.fetchone()
 
-    resp = jsonify({"message": "Login successful"})
-    resp.set_cookie(
-        "token",
-        token,
-        httponly=True,
-        samesite="Lax",
-        secure=False
-    )
-    return resp
+        if not user:
+            return jsonify({"error": "User does not exist in database"}), 401
 
-# ================= LOGOUT =================
+        if user["is_locked"]:
+            return jsonify({"error": "Too many failed attempts. Account locked."}), 403
+
+        if user["password"] != password:
+            new_attempts = user["failed_attempts"] + 1
+
+            if new_attempts >= 6:
+                cursor.execute(
+                    "UPDATE users SET failed_attempts=%s, is_locked=TRUE WHERE id=%s",
+                    (new_attempts, user["id"])
+                )
+                conn.commit()
+                return jsonify({"error": "Too many failed attempts. Account locked."}), 403
+
+            cursor.execute(
+                "UPDATE users SET failed_attempts=%s WHERE id=%s",
+                (new_attempts, user["id"])
+            )
+            conn.commit()
+
+            attempts_left = 6 - new_attempts
+
+            if attempts_left <= 3:
+                return jsonify({
+                    "error": "Invalid username or password",
+                    "message": f"You have {attempts_left} attempts left"
+                }), 401
+
+            return jsonify({"error": "Invalid username or password"}), 401
+
+        cursor.execute(
+            "UPDATE users SET failed_attempts=0 WHERE id=%s",
+            (user["id"],)
+        )
+        conn.commit()
+
+        token = generate_token(user["id"])
+
+        response = make_response(jsonify({"message": "Login successful"}))
+        response.set_cookie(
+            "token",
+            token,
+            httponly=True,
+            secure=False,   
+            samesite="Lax",
+            max_age=3600
+        )
+
+        return response
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
 @app.route("/logout", methods=["POST"])
 def logout():
     resp = jsonify({"message": "Logged out"})
     resp.set_cookie("token", "", expires=0)
     return resp
 
-# ================= GET ORDERS =================
 @app.route("/orders", methods=["GET"])
 @token_required
 def get_orders():
@@ -107,7 +163,6 @@ def get_orders():
 
     return jsonify(orders)
 
-# ================= ADD ORDER =================
 @app.route("/add-order", methods=["POST"])
 @token_required
 def add_order():
@@ -133,7 +188,6 @@ def add_order():
 
     return jsonify({"message": "Order added"})
 
-# ================= UPDATE ORDER =================
 @app.route("/update-order", methods=["PUT"])
 @token_required
 def update_order():
@@ -158,7 +212,6 @@ def update_order():
 
     return jsonify({"message": "Order updated"})
 
-# ================= DELETE ORDER =================
 @app.route("/delete-order", methods=["DELETE"])
 @token_required
 def delete_order():
@@ -179,11 +232,9 @@ def delete_order():
 
     return jsonify({"message": "Order deleted"})
 
-# ================= HOME =================
 @app.route("/")
 def home():
-    return "Backend running 🚀"
+    return "Vanakkam da mapla!"
 
-# ================= RUN =================
 if __name__ == "__main__":
     app.run(debug=True)
